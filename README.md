@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供十一个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供十二个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -109,6 +109,18 @@
   引用的 Example Object）。请求 Content-Type 无匹配返回 **415**，Accept 无匹配返回
   **406**，任一错误都**不返回半成品**且**不修改输入**。
 
+- **`POST /interactions/verify`**：为**联调记录做契约核对**。调用方提交一份 OpenAPI 3.x
+  契约、一个 `METHOD /path` 选择器，以及**一次真实请求 / 响应记录**：请求含
+  `path` / `query` / `header` / `cookie` 参数、`Content-Type`、`Accept` 与 JSON body，
+  响应含状态码、`headers`、`Content-Type` 与 body。服务先按 **path-level 与
+  operation-level 参数覆盖规则**（后者按 `(in, name)` 覆盖前者）计算有效参数，检查
+  **必填、类型、枚举与 readOnly/writeOnly**；再按**精确状态码 → `nXX` → `default`**
+  选出响应，并依据请求 `Content-Type` 与 `Accept` 选出两侧表示，随后用对应 schema
+  校验两个 body（readOnly/writeOnly 与 required 按方向生效，区分 3.0 `nullable` 与
+  3.1 类型联合）。返回 `200` + `valid` 与按**来源 JSON Pointer 稳定排序**的
+  请求 / 响应错误列表；**引用、媒体或响应选择失败返回 422 且不产生半成品**，
+  输入不被修改。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -133,6 +145,7 @@ docker compose up --build
 | Link 后续调用计划接口 | `POST http://localhost:8080/links/plan` |
 | 交互图接口 | `POST http://localhost:8080/interactions/graph` |
 | 内容协商选表示接口 | `POST http://localhost:8080/representations/select` |
+| 联调记录契约核对接口 | `POST http://localhost:8080/interactions/verify` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -1762,6 +1775,147 @@ curl -s -X POST http://localhost:8080/representations/select \
 > （415）→ 响应不可接受（406）。任何错误都**不返回半成品**（415 / 406 / 422 响应体不含
 > `request` / `response`）；协商过程**不会修改**请求中的 `document` 与各字段，输出的
 > schema / example 均为深拷贝。Docker 与 Docker Compose 的启动方式保持不变。
+
+## `POST /interactions/verify`：核对一次联调记录是否符合契约
+
+给定**一份** OpenAPI 3.x 文档、一个 `METHOD /path` 操作选择器和**一次真实请求 / 响应
+记录**（联调时抓到的实际交互），服务判定这次交互是否符合契约，返回 `valid` 与按
+**来源 JSON Pointer 稳定排序**的请求 / 响应错误列表。
+
+### 核对内容
+
+- **参数（path / query / header / cookie）**：先按规范合并 path-level 与
+  operation-level 参数（operation-level 按 `(in, name)` **整体覆盖** path-level，
+  同级重复声明为 422），然后逐项检查：
+  - **必填**：`required: true` 的参数（path 参数恒必填）必须在记录中出现；
+    显式 `null` 视为未提供；
+  - **类型 / 枚举**：记录值按参数的 `schema` 校验（header 名**大小写不敏感**匹配）；
+  - **readOnly/writeOnly**：对象值中出现 `readOnly` 属性即报错（请求方向语义）。
+    记录里出现契约未声明的参数**不报错**（只核对声明过的参数）。
+- **响应选择**：按 `response.status_code` 以**精确状态码 → `nXX`（大小写不敏感）→
+  `default`** 的顺序选出 Response Object；三者都不命中是 422（`response_not_declared`）。
+- **表示选择与双侧 schema 校验**：请求表示按记录的 `Content-Type` 从
+  `requestBody.content` 中选出（参数包含、通配符具体度、声明顺序）；响应表示按记录的
+  `Accept` 头做 RFC 9110 协商（缺失等同 `*/*`，空串或 `q=0` 拒绝一切）。随后用所选
+  媒体类型的 `schema` 校验两侧 body：请求侧禁止出现 `readOnly` 属性、响应侧禁止
+  `writeOnly` 属性，`required` 按方向生效（跨 `allOf` 分支、经本地 `$ref` 的方向标记
+  同样豁免），区分 3.0 `nullable` 与 3.1 类型联合。响应声明了 `content` 而记录没有
+  body 时按 JSON `null` 校验（通常报类型错误）。
+- **引用语义**：参数、requestBody、Response 与 schema 的本地 `$ref` 循环安全解析
+  （3.1 合并同级字段、3.0 忽略同级）；悬空 / 外部 / 循环引用一律 422。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/interactions/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"},
+                  "paths": {"/pets": {"...": "..."}} },
+    "selector": "POST /pets",
+    "request": {
+      "path": {}, "query": {"limit": 10},
+      "header": {"X-Tenant": "demo"}, "cookie": {"session": "abc"},
+      "content_type": "application/json",
+      "accept": "application/json",
+      "body": {"name": "rex"}
+    },
+    "response": {
+      "status_code": 200,
+      "headers": {"X-Request-Id": "r1"},
+      "content_type": "application/json",
+      "body": {"id": 7, "name": "rex"}
+    }
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的单个选择器（方法大小写不敏感，路径须逐字匹配）。
+- `request`（可省略，默认为空记录）：`path` / `query` / `header` / `cookie` 为
+  参数名 → JSON 值的对象；`content_type` / `accept` 为字符串；`body` 为任意 JSON。
+- `response`（必填）：`status_code` 为 100..599 的整数或数字字符串；`headers` 为
+  对象；`content_type` 为字符串；`body` 为任意 JSON。
+
+### 成功响应（`200`，核对不通过时也是 200）
+
+```json
+{
+  "valid": false,
+  "error_count": 2,
+  "errors": [
+    {
+      "side": "request",
+      "pointer": "/paths/~1pets/post/parameters/0",
+      "instance_pointer": "/request/query",
+      "keyword": "required",
+      "location": "query",
+      "name": "limit",
+      "reason": "missing required query parameter 'limit'"
+    },
+    {
+      "side": "response",
+      "pointer": "/paths/~1pets/post/responses/200/content/application~1json/schema/properties/id",
+      "instance_pointer": "/response/body/id",
+      "keyword": "type",
+      "location": null,
+      "name": null,
+      "reason": "expected type integer, got string"
+    }
+  ]
+}
+```
+
+字段说明：
+
+- `side`：`request`（请求参数 / 请求体）或 `response`（响应体）。
+- `pointer`：问题在**契约中的来源 JSON Pointer**——参数定义位置或被违反的 schema
+  位置（本地 `$ref` 跟随到组件定义）。
+- `instance_pointer`：问题值在**记录信封内**的 JSON Pointer
+  （如 `/request/query/limit`、`/response/body/items/0`；缺失参数指向其分组）。
+- `keyword` / `reason`：违反的检查项（`required` / `type` / `enum` / `readOnly` /
+  `writeOnly` / …）与人类可读原因。
+- `location` / `name`：参数错误的位置与名字；body 错误为 `null`。
+- `errors` 按 **`(pointer, side, instance_pointer, keyword, reason)` 升序稳定排序**，
+  与输入键序无关。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在。
+- `400 invalid_verify_request`：记录信封非法（未知字段、参数分组不是对象、header 名
+  仅大小写不同、`status_code` 缺失或越界、`content_type` / `accept` 无法解析等），
+  `messages` 逐条给出原因。
+- `422 verification_failed`：契约层问题导致无法核对，`errors` 按
+  `(code, pointer, error)` 稳定排序、**一次报齐且不产生半成品**：
+
+| code | 触发情形 |
+| --- | --- |
+| `unresolvable_reference` | 参数 / requestBody / Response / schema 的本地 `$ref` 悬空、外部或循环 |
+| `invalid_parameter` / `duplicate_parameter` | 参数声明非法或同级重复 `(in, name)` |
+| `invalid_operation` | path item / operation / requestBody / content 结构非法 |
+| `invalid_media_type` | content 的键不是合法媒体类型 |
+| `response_not_declared` | 状态码无精确 / `nXX` / `default` 响应 |
+| `unsupported_media_type` | 请求 `Content-Type` 不匹配任何声明的 requestBody 表示，或记录有 body 却无 `Content-Type` |
+| `not_acceptable` | `Accept` 下没有任何声明的响应表示可接受 |
+
+```json
+{
+  "error": "verification_failed",
+  "message": "the recorded exchange could not be checked against the contract; fix the reported references, media types or response selection first",
+  "errors": [
+    {
+      "code": "unresolvable_reference",
+      "pointer": "/paths/~1pets/post/parameters/0",
+      "ref": "#/components/parameters/Missing",
+      "error": "unresolvable reference '#/components/parameters/Missing': object has no property 'Missing'"
+    }
+  ]
+}
+```
+
+> 与其他接口一致：核对过程**不会修改**请求中的 `document` 与记录对象；即使校验已发现
+> 参数 / body 违规，只要核对过程中遇到悬空 / 外部 / 循环引用，整体仍返回 422 而不
+> 返回部分校验结果。
 
 ## 检查的变更类别
 

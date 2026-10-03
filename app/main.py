@@ -103,6 +103,17 @@ from .security import (
     SecurityDefinitionError,
     plan_security,
 )
+from .verifier import (
+    InvalidDocumentError as InvalidVerifyDocumentError,
+)
+from .verifier import (
+    InvalidSelectorError as InvalidVerifySelectorError,
+)
+from .verifier import (
+    InvalidVerifyRequestError,
+    VerificationFailedError,
+    verify_interaction,
+)
 
 app = FastAPI(
     title="OpenAPI Contract Compatibility Audit API",
@@ -215,7 +226,20 @@ app = FastAPI(
         "JSON Pointers, normalized media types and the schema/examples. "
         "An unsupported request Content-Type yields 415 and an "
         "unacceptable response yields 406; any contract error is 422 "
-        "with no partial result and the input is never modified."
+        "with no partial result and the input is never modified. "
+        "POST /interactions/verify checks one recorded joint-debugging "
+        "exchange (a real request/response pair) against the contract "
+        "of one operation: path-level and operation-level parameters "
+        "are merged (operation-level overrides by (in, name)) and "
+        "checked for required presence, type, enum and readOnly/"
+        "writeOnly; the response is selected by exact status code, "
+        "'nXX' wildcard then 'default'; the request Content-Type and "
+        "Accept header select the representations whose schemas "
+        "validate both recorded bodies (direction-aware readOnly/"
+        "writeOnly and required). It answers 200 with 'valid' and the "
+        "request/response errors sorted stably by source JSON Pointer; "
+        "reference, media-type or response selection failures return "
+        "422 with no partial result, and the input is never modified."
     ),
 )
 
@@ -621,6 +645,82 @@ class RepresentationSelectRequest(BaseModel):
     )
 
 
+class InteractionVerifyRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document describing the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation to verify against, in the 'METHOD /path' form "
+            "(e.g. 'POST /pets'); method is case-insensitive."
+        ),
+    )
+    request: Optional[Any] = Field(
+        default=None,
+        description=(
+            "The recorded request: 'path'/'query'/'header'/'cookie' objects "
+            "mapping parameter names to their JSON values (header names "
+            "match case-insensitively; null means 'absent'), plus the "
+            "'content_type' and 'accept' header values and the JSON 'body'. "
+            "Omit for an empty request record."
+        ),
+    )
+    response: Any = Field(
+        default=None,
+        description=(
+            "The recorded response: 'status_code' (integer 100..599 or a "
+            "digit string, required), plus optional 'headers', "
+            "'content_type' and 'body'."
+        ),
+    )
+
+
+class VerificationIssueModel(BaseModel):
+    side: Literal["request", "response"] = Field(
+        ..., description="Whether the violation belongs to the recorded request or response."
+    )
+    pointer: str = Field(
+        ...,
+        description=(
+            "Source JSON Pointer in the contract: the parameter definition "
+            "or the violated schema (local $refs followed to the component)."
+        ),
+    )
+    instance_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer into the recorded request/response envelope "
+            "(e.g. '/request/query/limit', '/response/body/items/0')."
+        ),
+    )
+    keyword: str = Field(
+        ..., description="The violated check ('required', 'type', 'enum', 'readOnly', ...)."
+    )
+    location: Optional[str] = Field(
+        ...,
+        description="The parameter location ('path'/'query'/'header'/'cookie'); null for body checks.",
+    )
+    name: Optional[str] = Field(
+        ..., description="The declared parameter name; null for body checks."
+    )
+    reason: str = Field(..., description="Human-readable explanation")
+
+
+class InteractionVerifyResponse(BaseModel):
+    valid: bool = Field(
+        ..., description="True when the recorded exchange satisfies the contract."
+    )
+    error_count: int
+    errors: List[VerificationIssueModel] = Field(
+        ...,
+        description=(
+            "Violations sorted stably by source JSON Pointer, then side, "
+            "instance pointer, keyword and reason."
+        ),
+    )
+
+
 class InteractionNodeModel(BaseModel):
     id: str = Field(
         ...,
@@ -937,6 +1037,7 @@ def root() -> Dict[str, str]:
         "links_plan": "POST /links/plan",
         "interactions_graph": "POST /interactions/graph",
         "representations_select": "POST /representations/select",
+        "interactions_verify": "POST /interactions/verify",
     }
 
 
@@ -1621,6 +1722,71 @@ def representations_select(payload: RepresentationSelectRequest) -> JSONResponse
                     "the representation could not be selected due to a "
                     "contract-level problem on the selected operation; fix "
                     "the reported structure or references first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post(
+    "/interactions/verify",
+    response_model=InteractionVerifyResponse,
+    responses={
+        200: {"description": "The verification verdict (valid or not)"},
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector is "
+            "malformed/unknown, or the request/response record envelope is "
+            "malformed"
+        },
+        422: {
+            "description": "A contract-level problem blocks the verification: "
+            "a dangling, external or circular local $ref, a malformed "
+            "parameter or media-type declaration, a request Content-Type or "
+            "Accept header that selects no representation, or a status code "
+            "no declared response covers; no partial result is returned"
+        },
+    },
+    summary="Verify a recorded request/response exchange against the contract",
+)
+def interactions_verify(payload: InteractionVerifyRequest) -> JSONResponse:
+    try:
+        result = verify_interaction(
+            payload.document,
+            payload.selector,
+            payload.request,
+            payload.response,
+        )
+    except InvalidVerifyDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidVerifySelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidVerifyRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_verify_request",
+                "messages": exc.messages,
+            },
+        )
+    except VerificationFailedError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "verification_failed",
+                "message": (
+                    "the recorded exchange could not be checked against the "
+                    "contract; fix the reported references, media types or "
+                    "response selection first"
                 ),
                 "errors": exc.errors,
             },
