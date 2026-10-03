@@ -108,6 +108,17 @@
   **JSON Pointer、规范化媒体类型以及对应 schema / example / examples**（含经本地 `$ref`
   引用的 Example Object）。请求 Content-Type 无匹配返回 **415**，Accept 无匹配返回
   **406**，任一错误都**不返回半成品**且**不修改输入**。
+- **`POST /exchanges/verify`**：为**一条联调记录**做契约核对。调用方提交一份 OpenAPI 3.x
+  契约、一个 `METHOD /path` 选择器和一次**真实请求 / 响应**：请求含 `path` / `query` /
+  `header` / `cookie` 参数值、`Content-Type`、`Accept` 与 JSON `body`；响应含 `status_code`、
+  `headers`、`Content-Type` 与 `body`。服务按 **path-level 参数与 operation-level 参数合并**
+  （后者按 `(in, name)` 覆盖）规则检查每个参数的**必填、类型、枚举与 readOnly / writeOnly
+  方向性**；响应按**精确状态码 → `nXX`（大小写不敏感）→ `default`** 选出；请求表示按请求
+  Content-Type 匹配、响应表示优先按真实响应 Content-Type 匹配（缺省时回退 Accept 协商），
+  随后对两侧 **JSON 表示的 schema**（含方向相关的 required / readOnly / writeOnly、3.0
+  `nullable` 与 3.1 类型联合）逐条核对。引用解析失败、媒体选择失败、响应无法选择一律 **422**
+  且**不产生半成品**；纯粹的值不符返回 **200 + `valid=false`**，请求 / 响应错误按**来源
+  JSON Pointer 稳定排序**。
 
 ## 一条命令启动
 
@@ -133,6 +144,7 @@ docker compose up --build
 | Link 后续调用计划接口 | `POST http://localhost:8080/links/plan` |
 | 交互图接口 | `POST http://localhost:8080/interactions/graph` |
 | 内容协商选表示接口 | `POST http://localhost:8080/representations/select` |
+| 联调记录契约核对接口 | `POST http://localhost:8080/exchanges/verify` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -1762,6 +1774,217 @@ curl -s -X POST http://localhost:8080/representations/select \
 > （415）→ 响应不可接受（406）。任何错误都**不返回半成品**（415 / 406 / 422 响应体不含
 > `request` / `response`）；协商过程**不会修改**请求中的 `document` 与各字段，输出的
 > schema / example 均为深拷贝。Docker 与 Docker Compose 的启动方式保持不变。
+
+## `POST /exchanges/verify`：核对一条联调记录是否符合契约
+
+用于**联调后核对“这次真实收发是否符合契约”**：给定一份 OpenAPI 3.x 文档、一个操作选择器
+与一次真实请求 / 响应记录，服务检查参数与两侧 JSON 体，并把每条不符以**来源 JSON Pointer**
+报告。核对结果分两类：
+
+- **契约层失败**（引用、媒体类型、响应选择）→ **HTTP 422**，整批拒绝、**不产生半成品**；
+- **值不符契约**（缺必填、类型 / 枚举错误、方向标记违规）→ **HTTP 200，`valid=false`**，
+  `errors` 给出全部不符。
+
+### 参数检查（path / query / header / cookie）
+
+- 先按 **path-level `parameters` 与 operation-level `parameters` 合并**：同一 `(in, name)`
+  以 operation 级定义覆盖 path 级；参数定义（含 `#/components/parameters/...` 本地 `$ref`、
+  3.1 path item 同级合并）循环安全解析，悬空 / 外部 / 循环引用 422。
+- 每个参数按其 `schema` 检查**必填**（path 参数恒必填；其余取 `required`）、**类型**
+  （integer / number 包含关系、3.0 `nullable` 与 3.1 `"null"` 联合）、**枚举**及 schema 的
+  其余约束（minLength / minimum / pattern / items / allOf / oneOf 等）。
+- **方向性**：`readOnly: true` 的参数出现在请求中报 `readOnly`；`writeOnly: true` 的参数 /
+  响应头出现在响应中报 `writeOnly`。
+- **header 名大小写不敏感匹配**；记录中两个仅大小写不同的 header 键视为歧义，返回 400。
+- 参数值缺省或为 JSON `null` 视为“线上无值”：必填报 `required`，可选项跳过。
+- 响应侧还检查所选 Response Object 的 `headers`（含 `$ref`），规则同上。
+- 使用 `content` 媒体映射（而非 `schema`）的参数 / 响应头无法离线按 JSON 核对，仅检查必填。
+
+### 请求表示选择
+
+- 操作无 `requestBody`：不做体检查，`request.present=false`。
+- `required: true` 但记录无体（无 `content_type` 且无 `body`）→ 422（`request_body_missing`）；
+  有 `body` 但缺 `content_type` → 422（`request_body_content_type_missing`）。
+- 请求 Content-Type 必须是**具体媒体类型**（语法非法或含通配 400），并在
+  `requestBody.content` 中按与 `/representations/select` 相同的**参数包含 + 通配具体度 +
+  声明顺序**规则命中一项；无命中 → 422（`unsupported_media_type`，附 `supported`）。
+- 仅当命中的表示是 **JSON 媒体类型**（`application/json` 或 `*+json`）时才按其 schema 核对
+  JSON `body`；非 JSON 表示不做体检查（`request.json=false`）。
+
+### 响应选择与表示
+
+- 响应按**精确码 → `nXX`（大小写不敏感）→ `default`** 选出（整数与数字字符串等价，
+  输出统一整数）；三者皆无 → 422（`response_not_declared`）。状态码必须 100～599，否则 400。
+- 所选响应**无 `content`**（如 `204`）：不做体检查，`response.present=false`。
+- 有内容时：
+  1. 记录**带响应 Content-Type**：必须命中一项声明媒体类型，否则 422
+     （`response_media_type_not_declared`，附 `available`）；命中后还必须被请求 `Accept`
+     接受（未给 Accept 等价 `*/*`；空 Accept / `q=0` 拒绝），否则 422（`not_acceptable`）。
+  2. 记录**未带响应 Content-Type**：回退为按 `Accept` 协商选择（规则同
+     `/representations/select`）；选不出来（空 Accept、全体 `q=0` 且记录有体）→ 422
+     （`response_media_type_missing`）；无体则视为该响应无表示可核对。
+- 同样仅对 JSON 表示按 schema 核对响应 `body`。响应带了未声明的 Content-Type / body 属于
+  上述媒体选择 422；声明上无 `content` 的响应即使带体也不按 schema 核对。
+
+### 体 schema 的方向性
+
+与 `/examples/validate` 完全一致：请求体不得出现 `readOnly` 属性，响应体不得出现
+`writeOnly` 属性；`required` 仅在对应方向生效（`readOnly` 必填只要求响应、`writeOnly`
+必填只要求请求），`allOf` 分支上的方向标记同样可豁免另一分支贡献的必填项。schema 内本地
+`$ref` 循环安全解析；悬空 / 外部引用 → 422（不产生值不符列表）。
+
+### 返回字段
+
+- `operation_pointer`：所选操作的 JSON Pointer。
+- `request`：`present`（记录是否带体）、命中的 `declared_media_type`（content 对象原始键）、
+  `media_type_pointer` 与 `json`（是否按 JSON schema 核对过）；无表示时后三项为 `null` /
+  `false`。
+- `response`：整数 `status_code`、命中键 `key`、`match`（`exact` / `wildcard` /
+  `default`）、`response_pointer`，以及与 `request` 相同的表示字段。
+- `valid` / `error_count` / `errors`。每条错误含：
+  - `side`：`request` 或 `response`（**先请求后响应**）；
+  - `location`：`path` / `query` / `header` / `cookie`，体错误为 `null`；
+  - `name`：参数 / 响应头名，体错误为 `null`；
+  - `source_pointer`：契约来源 Pointer——缺必填指向参数 / 响应头定义，类型 / 枚举 /
+    readOnly / writeOnly 等指向**被违反的 schema 位置**（`$ref` 跟随到组件定义）；
+  - `instance_pointer`：记录值 / JSON 体内的位置（整值错误为空串，体属性为如 `/name`）；
+  - `keyword`、`reason`：关键字（如 `required` / `type` / `enum` / `readOnly`）与说明。
+- 错误按 **`side` → `source_pointer` → `instance_pointer` → location / name / keyword /
+  reason** 稳定排序，与输入键序无关。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/exchanges/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": {
+      "openapi": "3.0.3",
+      "info": {"title": "Pet API", "version": "1.0"},
+      "paths": {
+        "/pets": {
+          "post": {
+            "parameters": [
+              {"name": "trace", "in": "header", "schema": {"type": "string", "enum": ["a", "b"]}}
+            ],
+            "requestBody": {"required": true, "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}},
+            "responses": {
+              "201": {"description": "created", "headers": {
+                  "X-Total": {"schema": {"type": "integer"}}},
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}},
+              "4XX": {"description": "problem", "content": {
+                  "application/problem+json": {"schema": {"type": "object"}}}}
+            }
+          }
+        }
+      },
+      "components": {"schemas": {"Pet": {"type": "object", "required": ["name"],
+        "properties": {"id": {"type": "integer", "readOnly": true},
+                       "name": {"type": "string"},
+                       "password": {"type": "string", "writeOnly": true}}}}}
+    },
+    "selector": "POST /pets",
+    "request": {
+      "header": {"Trace": "z"},
+      "content_type": "application/json; charset=utf-8",
+      "accept": "application/json",
+      "body": {"id": 9, "password": "secret"}
+    },
+    "response": {
+      "status_code": 201,
+      "headers": {"X-Total": "many"},
+      "content_type": "application/json",
+      "body": {"id": 9, "name": "Rex", "password": "secret"}
+    }
+  }'
+```
+
+- `request`（可省略，等价空请求）：`path` / `query` / `header` / `cookie` 为“参数名 → JSON
+  值”的对象；另有 `content_type`（具体媒体类型字符串）、`accept`（字符串，省略等价
+  `*/*`，空串拒绝一切）与 `body`（已解析的 JSON）。
+- `response`（必填）：`status_code`（整数或数字字符串）、可选 `headers`（响应头名 → JSON
+  值）、`content_type` 与 `body`。
+
+### 成功响应（`200`，值不符时 `valid=false`）
+
+```json
+{
+  "operation_pointer": "/paths/~1pets/post",
+  "request": {"present": true, "declared_media_type": "application/json",
+              "media_type_pointer": "/paths/~1pets/post/requestBody/content/application~1json",
+              "json": true},
+  "response": {"status_code": 201, "key": "201", "match": "exact",
+               "response_pointer": "/paths/~1pets/post/responses/201",
+               "present": true, "declared_media_type": "application/json",
+               "media_type_pointer": "/paths/~1pets/post/responses/201/content/application~1json",
+               "json": true},
+  "valid": false,
+  "error_count": 5,
+  "errors": [
+    {"side": "request", "location": null, "name": null,
+     "source_pointer": "/components/schemas/Pet",
+     "instance_pointer": "", "keyword": "required",
+     "reason": "required property '"'"'name'"'"' is missing"},
+    {"side": "request", "location": null, "name": null,
+     "source_pointer": "/components/schemas/Pet/properties/id",
+     "instance_pointer": "/id", "keyword": "readOnly",
+     "reason": "readOnly property '"'"'id'"'"' must not appear in a request example"},
+    {"side": "request", "location": "header", "name": "trace",
+     "source_pointer": "/paths/~1pets/post/parameters/0/schema",
+     "instance_pointer": "", "keyword": "enum",
+     "reason": "value is not one of the 2 allowed enum values"},
+    {"side": "response", "location": null, "name": null,
+     "source_pointer": "/components/schemas/Pet/properties/password",
+     "instance_pointer": "/password", "keyword": "writeOnly",
+     "reason": "writeOnly property '"'"'password'"'"' must not appear in a response example"},
+    {"side": "response", "location": "header", "name": "X-Total",
+     "source_pointer": "/paths/~1pets/post/responses/201/headers/X-Total/schema",
+     "instance_pointer": "", "keyword": "type",
+     "reason": "expected type integer, got string"}
+  ]
+}
+```
+
+> 上例响应体的 `password`（writeOnly）报 `response` 侧 `writeOnly`；请求体中的 `password`
+> 合法、`id`（readOnly）非法。把 `status_code` 改为 `404`、响应 `content_type` 改为
+> `application/problem+json`（并带上该 problem schema 要求的字段）即命中 `4XX`
+> （`match: "wildcard"`）。
+
+### 错误响应
+
+- `400 invalid_openapi_document` / `400 invalid_selector`：文档不是 OpenAPI 3.x，或选择器
+  形态错误 / 路径 / 方法不存在。
+- `400 invalid_exchange_request`：信封形态错误，`messages` 逐条给出原因，例如
+  `exchange.response must be an object`、`status_code 'nope' must consist of digits only`、
+  `request.content_type` 非法 / 含通配、`accept` 区间非法、参数组 / headers 不是对象、
+  两个仅大小写不同的 header 键等。（顶层 `response` 整体缺失由请求体校验返回 422。）
+- **`422 exchange_verification_failed`**：契约层失败，`errors` 每条带 `code`、`pointer`、
+  `error`，包括：
+  - `response_not_declared`（附 `status_code`）、`request_body_missing`、
+    `request_body_content_type_missing`、`unsupported_media_type`（附 `content_type` /
+    `supported`）、`response_media_type_not_declared`（附 `available`）、
+    `response_media_type_missing`、`not_acceptable`；
+  - `invalid_operation` / `invalid_media_type`：requestBody / Response / content / Media
+    Type Object 形态非法；
+  - `unresolvable_reference`：参数、requestBody、Response、Header、媒体 schema 的本地
+    `$ref` 悬空、外部、目标非对象或循环（pointer 指向 `$ref` 出现处，另附 `ref`）。
+
+```json
+{
+  "error": "exchange_verification_failed",
+  "message": "the exchange could not be verified due to a contract-level reference, media type or response selection problem; fix the reported contract before checking the recorded values",
+  "errors": [
+    {"code": "unsupported_media_type", "pointer": "/paths/~1pets/post/requestBody/content",
+     "content_type": "text/csv", "supported": ["application/json"],
+     "error": "the request Content-Type does not match any requestBody representation declared by the operation"}
+  ]
+}
+```
+
+> 核对过程**不会修改**请求中的 `document` 与记录字段；任何 422 都只返回错误、不含
+> `valid` / `errors` 值不符列表（**不出半成品**）。现有接口与 Docker / Docker Compose
+> 启动方式保持不变。
 
 ## 检查的变更类别
 

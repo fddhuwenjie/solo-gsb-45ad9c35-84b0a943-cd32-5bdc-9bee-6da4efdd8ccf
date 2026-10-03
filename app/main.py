@@ -31,6 +31,13 @@ from .examples import (
     InvalidExampleDocumentError,
     validate_document_examples,
 )
+from .exchanges import (
+    ExchangeContractError,
+    InvalidDocumentError as InvalidExchangeDocumentError,
+    InvalidExchangeRequestError,
+    InvalidSelectorError as InvalidExchangeSelectorError,
+    verify_exchange,
+)
 from .interactions import (
     GraphBuildError,
 )
@@ -215,7 +222,19 @@ app = FastAPI(
         "JSON Pointers, normalized media types and the schema/examples. "
         "An unsupported request Content-Type yields 415 and an "
         "unacceptable response yields 406; any contract error is 422 "
-        "with no partial result and the input is never modified."
+        "with no partial result and the input is never modified. "
+        "POST /exchanges/verify contract-checks one recorded "
+        "joint-debugging HTTP exchange: path-level parameters merged "
+        "with operation-level ones (operation overrides by in+name) are "
+        "checked for required/type/enum and readOnly/writeOnly, the "
+        "response is selected by exact code, 'nXX' then 'default', the "
+        "request representation is chosen from the request Content-Type "
+        "and the response representation from the response Content-Type "
+        "(Accept as fallback), and both JSON bodies are validated "
+        "against their media-type schemas. Reference, media or response "
+        "selection failures return 422 with no half-finished verdict; "
+        "schema mismatches return 200 with valid=false and request/"
+        "response errors sorted stably by source JSON Pointer."
     ),
 )
 
@@ -621,6 +640,130 @@ class RepresentationSelectRequest(BaseModel):
     )
 
 
+class ExchangeVerifyRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document describing the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation that produced the recorded exchange, in the "
+            "'METHOD /path' form (e.g. 'POST /pets'); method is "
+            "case-insensitive."
+        ),
+    )
+    request: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "The recorded request. Optional members: 'path', 'query', "
+            "'header' and 'cookie' (objects mapping declared parameter "
+            "names to JSON values; header names match case-insensitively), "
+            "'content_type' (the concrete Content-Type header string), "
+            "'accept' (the Accept header string; omitted equals '*/*') and "
+            "'body' (the already-parsed JSON request body)."
+        ),
+    )
+    response: Dict[str, Any] = Field(
+        ...,
+        description=(
+            "The recorded response. 'status_code' is required (integer "
+            "100..599 or a digit string); optional members are 'headers' "
+            "(object mapping response header names to JSON values), "
+            "'content_type' (the concrete Content-Type header string) and "
+            "'body' (the already-parsed JSON response body)."
+        ),
+    )
+
+
+class ExchangeViolationModel(BaseModel):
+    side: Literal["request", "response"] = Field(
+        ..., description="Which side of the exchange violates the contract."
+    )
+    location: Optional[str] = Field(
+        ...,
+        description=(
+            "Parameter location for parameter violations: 'path', 'query', "
+            "'header' or 'cookie'; null for request/response body violations."
+        ),
+    )
+    name: Optional[str] = Field(
+        ..., description="The parameter/header name, or null for body violations."
+    )
+    source_pointer: str = Field(
+        ...,
+        description=(
+            "Stable source JSON Pointer of the violated contract node: the "
+            "parameter/header definition for presence violations, the "
+            "violated schema location ($ref followed to its component "
+            "definition) for type/enum/readOnly/writeOnly violations."
+        ),
+    )
+    instance_pointer: str = Field(
+        ...,
+        description=(
+            "JSON Pointer within the recorded parameter value or JSON body "
+            "where the violation was found; the empty string for the whole "
+            "value (e.g. a missing required parameter)."
+        ),
+    )
+    keyword: str = Field(..., description="The violated keyword (e.g. required/type/enum/readOnly).")
+    reason: str = Field(..., description="Human-readable explanation.")
+
+
+class ExchangeSelectionModel(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    present: bool = Field(
+        ..., description="Whether the exchange side carried a body."
+    )
+    declared_media_type: Optional[str] = Field(
+        ...,
+        description="The selected content-map media type key; null when no body.",
+    )
+    media_type_pointer: Optional[str] = Field(
+        ..., description="JSON Pointer of the selected Media Type Object."
+    )
+    json_representation: bool = Field(
+        default=False,
+        alias="json",
+        description=(
+            "Whether the selected representation is a JSON media type whose "
+            "schema was checked (serialized as the 'json' field)."
+        ),
+    )
+
+
+class ExchangeResponseSelectionModel(ExchangeSelectionModel):
+    status_code: int = Field(..., description="The recorded integer status code.")
+    key: str = Field(..., description="The matched responses map key.")
+    match: Literal["exact", "wildcard", "default"] = Field(
+        ..., description="How the response key was selected."
+    )
+    response_pointer: str = Field(
+        ..., description="JSON Pointer of the selected Response Object."
+    )
+
+
+class ExchangeVerifyResponse(BaseModel):
+    operation_pointer: str = Field(
+        ..., description="JSON Pointer of the verified operation."
+    )
+    request: ExchangeSelectionModel
+    response: ExchangeResponseSelectionModel
+    valid: bool = Field(
+        ...,
+        description="True only when the recorded exchange satisfies every checked constraint.",
+    )
+    error_count: int
+    errors: List[ExchangeViolationModel] = Field(
+        ...,
+        description=(
+            "Request then response violations, sorted stably by source JSON "
+            "Pointer, then instance pointer, location, name, keyword and reason."
+        ),
+    )
+
+
 class InteractionNodeModel(BaseModel):
     id: str = Field(
         ...,
@@ -937,6 +1080,7 @@ def root() -> Dict[str, str]:
         "links_plan": "POST /links/plan",
         "interactions_graph": "POST /interactions/graph",
         "representations_select": "POST /representations/select",
+        "exchanges_verify": "POST /exchanges/verify",
     }
 
 
@@ -1621,6 +1765,67 @@ def representations_select(payload: RepresentationSelectRequest) -> JSONResponse
                     "the representation could not be selected due to a "
                     "contract-level problem on the selected operation; fix "
                     "the reported structure or references first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post(
+    "/exchanges/verify",
+    response_model=ExchangeVerifyResponse,
+    responses={
+        200: {"description": "The exchange was checked; valid=false reports contract mismatches"},
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector is "
+            "malformed/unknown, or the exchange envelope is malformed"
+        },
+        422: {
+            "description": "A reference, media type or response selection "
+            "failure on the selected operation; no partial verdict is returned"
+        },
+    },
+    summary="Verify one recorded request/response exchange against the contract",
+)
+def exchanges_verify(payload: ExchangeVerifyRequest) -> JSONResponse:
+    try:
+        result = verify_exchange(
+            payload.document,
+            payload.selector,
+            {"request": payload.request, "response": payload.response},
+        )
+    except InvalidExchangeDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidExchangeSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidExchangeRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_exchange_request",
+                "messages": exc.messages,
+            },
+        )
+    except ExchangeContractError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "exchange_verification_failed",
+                "message": (
+                    "the exchange could not be verified due to a contract-"
+                    "level reference, media type or response selection "
+                    "problem; fix the reported contract before checking the "
+                    "recorded values"
                 ),
                 "errors": exc.errors,
             },
